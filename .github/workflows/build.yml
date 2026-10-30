@@ -134,6 +134,18 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # ---------- 安装 cargo-tauri（版本与 MERGE.md 钉死的一致） ----------
+      - name: Cache cargo-tauri binary
+        id: cache-tauri
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri.exe
+          key: cargo-tauri-3.0.0-alpha.5-${{ runner.os }}
+
+      - name: Install tauri-cli 3.0.0-alpha.5
+        if: steps.cache-tauri.outputs.cache-hit != 'true'
+        run: cargo install tauri-cli --version 3.0.0-alpha.5 --locked
+
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
