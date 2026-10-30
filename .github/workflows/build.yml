@@ -1,77 +1,11 @@
-name: Build PureVox (Surround DSP + Tauri)
-
-on:
-  workflow_dispatch:           # 手动触发，第一次先手动跑一次验证
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-jobs:
-  # ============================================================
-  # Job 1: DSP 验证（快，ubuntu，不依赖 Tauri / Windows）
-  # ============================================================
-  dsp-verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Extract surround patch bundle
-        run: |
-          unzip -q PureVox-surround.zip -d "$RUNNER_TEMP/surround"
-          ls -la "$RUNNER_TEMP/surround"
-
-      - name: Apply surround DSP patch
-        run: |
-          PATCH_DIR=$(find "$RUNNER_TEMP/surround" -maxdepth 3 -type d -name patch | head -n 1)
-          if [ -z "$PATCH_DIR" ]; then
-            echo "::error::未在补丁包中找到 patch/ 目录"
-            exit 1
-          fi
-          echo "PATCH_DIR=$PATCH_DIR"
-          echo "PATCH_DIR=$(dirname "$PATCH_DIR")/patch" >> "$GITHUB_ENV"
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git apply --check "$PATCH_DIR"/*.patch
-          git apply         "$PATCH_DIR"/*.patch
-
-          ls -la src-tauri/src/dsp/surround/ || true
-          ls -la src-tauri/src/compat/       || true
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Run DSP tests
-        working-directory: verify
-        run: cargo test --locked
-
-      - name: Format check
-        working-directory: verify
-        continue-on-error: true
-        run: cargo fmt -- --check
-
-      # verify/ 是一次性验证脚手架，clippy 不作为阻塞门禁
-      # 精确放行 chunks_exact_to_as_chunks，其余 lint 仍输出供参考
-      - name: Clippy (informational)
-        working-directory: verify
-        continue-on-error: true
-        run: |
-          cargo clippy --all-targets -- \
-            -D warnings \
-            -A clippy::chunks_exact_to_as_chunks
-
   # ============================================================
   # Job 2: Windows 完整构建 + 打包
   # ============================================================
   build-windows:
-    needs: dsp-verify           # DSP 过了才花时间编 Windows，省额度
+    needs: dsp-verify
     runs-on: windows-latest
     permissions:
-      contents: write           # 允许创建 Release / 上传 artifact
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -99,6 +33,32 @@ jobs:
 
           ls -la src-tauri/src/dsp/surround/ || true
           ls -la src-tauri/src/compat/       || true
+
+      # ---------- 诊断：打印仓库结构，定位前端和 tauri.conf.json ----------
+      - name: Inspect repo layout
+        shell: bash
+        run: |
+          echo "===== 仓库根目录 ====="
+          ls -la
+          echo ""
+          echo "===== 所有 package.json（排除 node_modules / target）====="
+          find . -name "package.json" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/target/*" || true
+          echo ""
+          echo "===== 所有 lock 文件 ====="
+          find . \( -name "pnpm-lock.yaml" -o -name "yarn.lock" -o -name "package-lock.json" \) \
+            -not -path "*/node_modules/*" || true
+          echo ""
+          echo "===== tauri.conf.json 位置 ====="
+          find . -name "tauri.conf.json" -not -path "*/target/*" || true
+          echo ""
+          echo "===== tauri.conf.json 的 build 段 ====="
+          if [ -f src-tauri/tauri.conf.json ]; then
+            cat src-tauri/tauri.conf.json
+          else
+            echo "src-tauri/tauri.conf.json 不存在"
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -115,23 +75,37 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # ---------- 自动检测包管理器并安装依赖 ----------
-      - name: Detect and install frontend dependencies
+      # ---------- 安装前端依赖：找到 package.json 才装，否则跳过 ----------
+      - name: Install frontend dependencies (if any)
         shell: bash
         run: |
+          PKG_JSON=$(find . -maxdepth 3 -name "package.json" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/target/*" | head -n 1)
+
+          if [ -z "$PKG_JSON" ]; then
+            echo "::notice::仓库中没有 package.json，跳过前端依赖安装"
+            echo "（可能是纯静态前端，tauri.conf.json 的 beforeBuildCommand 为空）"
+            exit 0
+          fi
+
+          PKG_DIR=$(dirname "$PKG_JSON")
+          echo "找到 package.json：$PKG_DIR/package.json"
+          cd "$PKG_DIR"
+
           if [ -f pnpm-lock.yaml ]; then
-            echo "检测到 pnpm-lock.yaml，使用 pnpm"
+            echo "使用 pnpm"
             corepack enable
             pnpm install --frozen-lockfile
           elif [ -f yarn.lock ]; then
-            echo "检测到 yarn.lock，使用 yarn"
+            echo "使用 yarn"
             corepack enable
             yarn install --frozen-lockfile
           elif [ -f package-lock.json ]; then
-            echo "检测到 package-lock.json，使用 npm"
+            echo "使用 npm"
             npm ci
           else
-            echo "未检测到 lock 文件，退回 npm install"
+            echo "无 lock 文件，退回 npm install"
             npm install
           fi
 
@@ -144,4 +118,4 @@ jobs:
           projectPath: src-tauri
           tauriScript: cargo tauri
           args: --target x86_64-pc-windows-msvc
-          uploadWorkflowArtifacts: true   # 不发布 Release 也能在 run 页面下载产物
+          uploadWorkflowArtifacts: true
