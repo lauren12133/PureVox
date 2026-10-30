@@ -1,0 +1,145 @@
+name: Build PureVox (Surround DSP + Tauri)
+
+on:
+  workflow_dispatch:           # 手动触发，第一次先手动跑一次验证
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ============================================================
+  # Job 1: DSP 验证（快，不依赖 Windows / Tauri）
+  # ============================================================
+  dsp-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract surround patch bundle
+        run: |
+          unzip -q PureVox-surround.zip -d /tmp/surround
+          # 确认解压结果（目录名可能是 PureVox-surround 或带 hash）
+          ls -la /tmp/surround
+
+      - name: Apply surround DSP patch
+        run: |
+          # 补丁包解压后目录名不固定，先找到含 patch 的那一层
+          PATCH_DIR=$(find /tmp/surround -maxdepth 3 -type d -name patch | head -n 1)
+          if [ -z "$PATCH_DIR" ]; then
+            echo "::error::未在补丁包中找到 patch/ 目录"
+            exit 1
+          fi
+          BASE_DIR=$(dirname "$PATCH_DIR")
+          echo "BASE_DIR=$BASE_DIR"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 先 --check，补丁对不上立刻报错，不会留下半合并状态
+          git apply --check "$PATCH_DIR"/*.patch
+          git apply         "$PATCH_DIR"/*.patch
+
+          # 打印合并后的关键文件，方便在日志里确认
+          ls -la src-tauri/src/dsp/surround/ || true
+          ls -la src-tauri/src/compat/       || true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run DSP tests
+        working-directory: verify
+        run: cargo test --locked
+
+      - name: Clippy
+        working-directory: verify
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format check
+        working-directory: verify
+        run: cargo fmt -- --check
+
+  # ============================================================
+  # Job 2: Windows 完整构建 + 打包
+  # ============================================================
+  build-windows:
+    needs: dsp-verify           # DSP 过了才花时间编 Windows，省额度
+    runs-on: windows-latest
+    permissions:
+      contents: write           # 允许创建 Release / 上传 artifact
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract surround patch bundle
+        shell: bash
+        run: |
+          unzip -q PureVox-surround.zip -d "$RUNNER_TEMP/surround"
+          ls -la "$RUNNER_TEMP/surround"
+
+      - name: Apply surround DSP patch
+        shell: bash
+        run: |
+          PATCH_DIR=$(find "$RUNNER_TEMP/surround" -maxdepth 3 -type d -name patch | head -n 1)
+          if [ -z "$PATCH_DIR" ]; then
+            echo "::error::未在补丁包中找到 patch/ 目录"
+            exit 1
+          fi
+          BASE_DIR=$(dirname "$PATCH_DIR")
+          echo "BASE_DIR=$BASE_DIR"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git apply --check "$PATCH_DIR"/*.patch
+          git apply         "$PATCH_DIR"/*.patch
+
+          ls -la src-tauri/src/dsp/surround/ || true
+          ls -la src-tauri/src/compat/       || true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Setup Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # ---------- 自动检测包管理器并安装依赖 ----------
+      - name: Detect and install frontend dependencies
+        shell: bash
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "检测到 pnpm-lock.yaml，使用 pnpm"
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            echo "检测到 yarn.lock，使用 yarn"
+            corepack enable
+            yarn install --frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            echo "检测到 package-lock.json，使用 npm"
+            npm ci
+          else
+            echo "未检测到 lock 文件，退回 npm install"
+            npm install
+          fi
+
+      # ---------- Tauri 构建 + 上传 artifact ----------
+      - name: Build with tauri-action
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: src-tauri
+          tauriScript: cargo tauri
+          args: --target x86_64-pc-windows-msvc
+          uploadWorkflowArtifacts: true   # 不发布 Release 也能在 run 页面下载产物
