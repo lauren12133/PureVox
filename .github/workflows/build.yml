@@ -1,11 +1,75 @@
+name: Build PureVox (Surround DSP + Tauri)
+
+on:
+  workflow_dispatch:           # 手动触发，第一次先手动跑一次验证
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ============================================================
+  # Job 1: DSP 验证（快，ubuntu，不依赖 Tauri / Windows）
+  # ============================================================
+  dsp-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract surround patch bundle
+        run: |
+          unzip -q PureVox-surround.zip -d "$RUNNER_TEMP/surround"
+          ls -la "$RUNNER_TEMP/surround"
+
+      - name: Apply surround DSP patch
+        run: |
+          PATCH_DIR=$(find "$RUNNER_TEMP/surround" -maxdepth 3 -type d -name patch | head -n 1)
+          if [ -z "$PATCH_DIR" ]; then
+            echo "::error::未在补丁包中找到 patch/ 目录"
+            exit 1
+          fi
+          echo "PATCH_DIR=$PATCH_DIR"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git apply --check "$PATCH_DIR"/*.patch
+          git apply         "$PATCH_DIR"/*.patch
+
+          ls -la src-tauri/src/dsp/surround/ || true
+          ls -la src-tauri/src/compat/       || true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run DSP tests
+        working-directory: verify
+        run: cargo test --locked
+
+      - name: Format check
+        working-directory: verify
+        continue-on-error: true
+        run: cargo fmt -- --check
+
+      # verify/ 是一次性验证脚手架，clippy 不作为阻塞门禁
+      - name: Clippy (informational)
+        working-directory: verify
+        continue-on-error: true
+        run: |
+          cargo clippy --all-targets -- \
+            -D warnings \
+            -A clippy::chunks_exact_to_as_chunks
+
   # ============================================================
   # Job 2: Windows 完整构建 + 打包
   # ============================================================
   build-windows:
-    needs: dsp-verify
+    needs: dsp-verify           # DSP 过了才花时间编 Windows，省额度
     runs-on: windows-latest
     permissions:
-      contents: write
+      contents: write           # 允许创建 Release / 上传 artifact
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +117,7 @@
           echo "===== tauri.conf.json 位置 ====="
           find . -name "tauri.conf.json" -not -path "*/target/*" || true
           echo ""
-          echo "===== tauri.conf.json 的 build 段 ====="
+          echo "===== tauri.conf.json 内容 ====="
           if [ -f src-tauri/tauri.conf.json ]; then
             cat src-tauri/tauri.conf.json
           else
@@ -118,4 +182,4 @@
           projectPath: src-tauri
           tauriScript: cargo tauri
           args: --target x86_64-pc-windows-msvc
-          uploadWorkflowArtifacts: true
+          uploadWorkflowArtifacts: true   # 不发布 Release 也能在 run 页面下载产物
